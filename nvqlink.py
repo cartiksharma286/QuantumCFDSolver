@@ -12,6 +12,8 @@ try:
 except ImportError:
     QISKIT_AVAILABLE = False
 
+import quantum_circuits
+
 class NVQLink:
     """
     Simulates the NVQLink interconnect for hybrid quantum-classical computing.
@@ -19,7 +21,7 @@ class NVQLink:
     and the quantum processing unit (QPU).
     """
 
-    def __init__(self, bandwidth_gbps=900, latency_us=1.5, use_qiskit=False):
+    def __init__(self, bandwidth_gbps=900, latency_us=1.5, use_qiskit=False, circuit_type='basic'):
         """
         Initialize the NVQLink simulation.
 
@@ -27,15 +29,21 @@ class NVQLink:
             bandwidth_gbps (float): Distributed bandwidth in GB/s. Default is 900 GB/s (approx NVLink 4.0).
             latency_us (float): Latency in microseconds.
             use_qiskit (bool): Whether to use real Qiskit simulation instead of a mock delay.
+            circuit_type (str): The type of quantum circuit to build (e.g., 'basic', 'vqe_ansatz').
         """
-        self.bandwidth_gbps = bandwidth_gbps
-        self.latency_us = latency_us
+        self.bandwidth = bandwidth_gbps
+        self.latency = latency_us
         self.connected = True
         self.use_qiskit = use_qiskit
-        
-        if self.use_qiskit and not QISKIT_AVAILABLE:
-            print("[NVQLink] Qiskit requested but not installed. Falling back to simulation mode.")
-            self.use_qiskit = False
+        self.circuit_type = circuit_type
+        self.sampler = None # Initialize sampler here
+
+        if self.use_qiskit:
+            if not QISKIT_AVAILABLE: # Use the existing QISKIT_AVAILABLE flag
+                print("[NVQLink] Qiskit requested but not installed. Falling back to simulation mode.")
+                self.use_qiskit = False
+            else:
+                self.sampler = Sampler() # Initialize sampler if Qiskit is available
             
         print(f"[NVQLink] Initialized with Bandwidth: {bandwidth_gbps} GB/s, Latency: {latency_us} us")
         if self.use_qiskit:
@@ -55,7 +63,7 @@ class NVQLink:
             raise ConnectionError("[NVQLink] Link is down.")
 
         data_size_bytes = data.nbytes
-        transfer_time = (data_size_bytes / (self.bandwidth_gbps * 1e9)) + (self.latency_us * 1e-6)
+        transfer_time = (data_size_bytes / (self.bandwidth * 1e9)) + (self.latency * 1e-6)
         
         # Simulate the time delay
         # In a real real-time app we might sleep, but for a solver loop we might just track "overhead"
@@ -70,20 +78,22 @@ class NVQLink:
         Run a small quantum circuit using Qiskit to process a value.
         This represents a 'Quantum Kernel' operation.
         """
-        # Create a simple circuit
-        qc = QuantumCircuit(2)
-        qc.h(0)
-        qc.cx(0, 1)
-        qc.rx(input_val, 0) # Encode data into rotation
-        qc.measure_all()
+        if not self.use_qiskit or self.sampler is None:
+            # Fallback if Qiskit is not available or not initialized
+            return random.random() # Return a random value as a mock result
+
+        # Build circuit using the factory
+        qc = quantum_circuits.build_circuit(self.circuit_type, num_qubits=2, param_val=input_val)
         
-        # Run it
-        sampler = Sampler()
-        job = sampler.run(qc)
+        if qc is None:
+             return 0.0
+
+        # Execute
+        job = self.sampler.run(qc)
         result = job.result()
         quasi_dists = result.quasi_dists[0]
         
-        # Interpret result: simple expectation value-ish from '00' probability
+        # Return probability of state 0
         p00 = quasi_dists.get(0, 0.0)
         return p00
 
@@ -111,7 +121,9 @@ class NVQLink:
             # Normalize to [0, pi] for rotation
             angle = (avg_b * scale * 100) % np.pi 
             
-            q_factor = self.run_qiskit_circuit(angle)
+            # Adapt depth
+            reps = self.adapt_circuit_depth(eigenvalue_param)
+            q_factor = self.run_qiskit_circuit(angle, reps=reps)
             pass
 
         # Simulating "Quantum computation time"
@@ -120,3 +132,58 @@ class NVQLink:
         # We return None to trigger the classical fallback/hybrid blend in the solver
         # In a real implementation we would return the solved block here.
         return None
+
+    def adapt_circuit_depth(self, eigenvalue_param):
+        """
+        Adapt the depth of the variational circuit based on the spectral properties of the problem.
+        Higher spectral radius (stiffer problem) -> Deeper circuit (more expressivity needed).
+        
+        Args:
+            eigenvalue_param (float): Estimated spectral radius.
+            
+        Returns:
+            int: Number of repetitions (layers) for the quantum circuit.
+        """
+        if eigenvalue_param is None:
+            return 1
+            
+        # Heuristic mapping
+        # lambda approx 8/dx^2. For 64x64, dx=1/63 => lambda ~ 32000
+        # Let's verify lambda range. 
+        # For 32x32: lambda ~ 8000
+        # We want depth 1-5.
+        
+        # Normalize arbitrarily for this demo
+        # If lambda > 10000 -> reps=2
+        # If lambda > 20000 -> reps=3
+        
+        if eigenvalue_param > 20000:
+            return 3
+        elif eigenvalue_param > 10000:
+            return 2
+        else:
+            return 1
+
+    def run_qiskit_circuit(self, input_val, reps=1):
+        """
+        Run a small quantum circuit using Qiskit to process a value.
+        This represents a 'Quantum Kernel' operation.
+        """
+        if not self.use_qiskit or self.sampler is None:
+            # Fallback if Qiskit is not available or not initialized
+            return random.random() # Return a random value as a mock result
+
+        # Build circuit using the factory with adaptive depth
+        qc = quantum_circuits.build_circuit(self.circuit_type, num_qubits=2, param_val=input_val, reps=reps)
+        
+        if qc is None:
+             return 0.0
+
+        # Execute
+        job = self.sampler.run(qc)
+        result = job.result()
+        quasi_dists = result.quasi_dists[0]
+        
+        # Return probability of state 0
+        p00 = quasi_dists.get(0, 0.0)
+        return p00
