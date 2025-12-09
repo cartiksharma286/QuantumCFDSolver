@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quantum-cfd-solver
+  labels:
+    app: quantum-cfd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: quantum-cfd
+  template:
+    metadata:
+      labels:
+        app: quantum-cfd
+    spec:
+      containers:
+      - name: solver
+        image: gcr.io/PROJECT_ID/quantum-cfd-solver:latest
+        imagePullPolicy: Always
+        args: ["--steps", "500", "--nx", "128", "--ny", "128", "--qiskit", "--re", "1000"]
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
