@@ -1,6 +1,6 @@
 import numpy as np
 from nvqlink import NVQLink
-from quantum_stats import initialize_field_quantum
+from quantum_stats import initialize_field_quantum, generate_stochastic_forcing
 from quantum_interferometry import QuantumInterferometry
 
 class QuantumHyperFluidSolver:
@@ -15,7 +15,9 @@ class QuantumHyperFluidSolver:
                  lx=1.0, ly=1.0, lz=1.0, lw=1.0, 
                  use_quantum_stats=True, lid_velocity=1.0, 
                  nvqlink_qiskit=False, n_blocks=(2,2), circuit_type='basic',
-                 compute_signatures=False):
+                 compute_signatures=False,
+                 forcing_intensity=0.0, distribution_type='fermi-dirac',
+                 obstacles=None):
         self.nx = nx
         self.ny = ny
         self.nz = nz
@@ -32,6 +34,13 @@ class QuantumHyperFluidSolver:
         self.lid_velocity = lid_velocity
         self.n_blocks_y, self.n_blocks_x = n_blocks
         self.compute_signatures = compute_signatures
+        
+        # Stochastic Forcing
+        self.forcing_intensity = forcing_intensity
+        self.distribution_type = distribution_type
+        
+        # Geometry Obstacles (Boolean Mask)
+        self.obstacles = obstacles
 
         # Initialize fields: shape (nw, nz, ny, nx)
         shape = (nw, nz, ny, nx)
@@ -168,36 +177,100 @@ class QuantumHyperFluidSolver:
         
         self.u[:] = 0
         self.v[:] = 0
-        self.w_vel[:] = 0
-        self.a_vel[:] = 0
-        
-        # Restore flow (this is a crude BC application, simplified for demo)
-        # Actually we should strictly enforce 0 at boundaries and preserve interior
-        # But `self.u[:] = 0` wipes everything.
-        # Correct approach:
-        # Zero out boundaries
-        # Face X=0
+        # No-slip walls at bottom, left, right
+        # Assuming 4D (w, z, y, x)
+        # X-boundaries (axis 3)
         self.u[:, :, :, 0] = 0
-        # Face X=L
         self.u[:, :, :, -1] = 0
-        # Face Y=0
+        self.v[:, :, :, 0] = 0
+        self.v[:, :, :, -1] = 0
+        self.w_vel[:, :, :, 0] = 0
+        self.w_vel[:, :, :, -1] = 0
+        self.a_vel[:, :, :, 0] = 0
+        self.a_vel[:, :, :, -1] = 0
+
+        # Y-boundaries (axis 2)
         self.u[:, :, 0, :] = 0
         self.v[:, :, 0, :] = 0
+        self.w_vel[:, :, 0, :] = 0
+        self.a_vel[:, :, 0, :] = 0
         
-        # Lid: Face Y=L (Top)
+        # Z-boundaries (axis 1)
+        self.u[:, 0, :, :] = 0
+        self.v[:, 0, :, :] = 0
+        self.w_vel[:, 0, :, :] = 0
+        self.a_vel[:, 0, :, :] = 0
+
+        # W-boundaries (axis 0)
+        self.u[0, :, :, :] = 0
+        self.v[0, :, :, :] = 0
+        self.w_vel[0, :, :, :] = 0
+        self.a_vel[0, :, :, :] = 0
+        
+        # Lid at top (y=max, index -1 in axis 2)
         self.u[:, :, -1, :] = self.lid_velocity
-        # All other velocities 0 on lid
         self.v[:, :, -1, :] = 0
         self.w_vel[:, :, -1, :] = 0
         self.a_vel[:, :, -1, :] = 0
-        
-        # Face Z=0, Z=L
         self.u[:, 0, :, :] = 0
         self.u[:, -1, :, :] = 0
         
         # Face W=0, W=L
         self.u[0, :, :, :] = 0
         self.u[-1, :, :, :] = 0
+
+        # Arbitrary Obstacles (Turbine Blades)
+        if self.obstacles is not None:
+            self.u[self.obstacles] = 0
+            self.v[self.obstacles] = 0
+            self.w_vel[self.obstacles] = 0
+            self.a_vel[self.obstacles] = 0
+
+    def compute_quantum_surface_integral(self):
+        """
+        Compute the force vector (Drag, Lift, Side) acting on the obstacles
+        using a Quantum Surface Integral approach (summation over boundary faces).
+        F = \oint (-p n + \tau \cdot n) dA
+        """
+        if self.obstacles is None:
+            return {'drag': 0.0, 'lift': 0.0, 'side': 0.0}
+            
+        mask = self.obstacles # (nw, nz, ny, nx)
+        p = self.p # (nw, nz, ny, nx)
+        
+        fx, fy, fz = 0.0, 0.0, 0.0
+        
+        # Grid steps
+        dy_dz = self.dy * self.dz # Area for x-face per unit w? 
+        dx_dz = self.dx * self.dz # Area for y-face
+        dx_dy = self.dx * self.dy # Area for z-face
+        
+        # 1. X-Faces (Normal = +/- x_hat)
+        # Right Face: Fluid at i+1. Normal +x. Force = -p(i+1)*Area
+        mask_right = mask[..., :-1] & ~mask[..., 1:]
+        fx += np.sum(-p[..., 1:][mask_right]) * dy_dz
+        
+        # Left Face: Fluid at i. Normal -x. Force = -p(i)*(-1)*Area = p(i)
+        mask_left = ~mask[..., :-1] & mask[..., 1:]
+        fx += np.sum(p[..., :-1][mask_left]) * dy_dz
+        
+        # 2. Y-Faces (Normal = +/- y_hat) -> Lift
+        # Top Face: Fluid at j+1. Normal +y. Force = -p(j+1)*Area
+        mask_top = mask[..., :-1, :] & ~mask[..., 1:, :]
+        fy += np.sum(-p[..., 1:, :][mask_top]) * dx_dz
+        
+        # Bottom Face
+        mask_bottom = ~mask[..., :-1, :] & mask[..., 1:, :]
+        fy += np.sum(p[..., :-1, :][mask_bottom]) * dx_dz
+        
+        # 3. Z-Faces
+        if self.nz > 1:
+            mask_front = mask[:, :-1, ...] & ~mask[:, 1:, ...]
+            fz += np.sum(-p[:, 1:, ...][mask_front]) * dx_dy
+            mask_back = ~mask[:, :-1, ...] & mask[:, 1:, ...]
+            fz += np.sum(p[:, :-1, ...][mask_back]) * dx_dy
+            
+        return {'drag': fx, 'lift': fy, 'side': fz}
 
     def analyze_flow_signatures(self, step_idx):
         """
@@ -218,8 +291,20 @@ class QuantumHyperFluidSolver:
         self.signatures.append(sig_data)
 
     def step(self, step_idx=0):
-        # 1. Advection (Skipped / Implicit via Init + correction in this simplified demo)
-        
+        # 1. Stochastic Quantum Forcing (Turbulence Injection)
+        if self.forcing_intensity > 0:
+            shape = self.u.shape
+            # Generate independent forcing for each component
+            fu = generate_stochastic_forcing(shape, self.distribution_type, intensity=self.forcing_intensity)
+            fv = generate_stochastic_forcing(shape, self.distribution_type, intensity=self.forcing_intensity)
+            fw = generate_stochastic_forcing(shape, self.distribution_type, intensity=self.forcing_intensity)
+            fa = generate_stochastic_forcing(shape, self.distribution_type, intensity=self.forcing_intensity)
+            
+            self.u += self.dt * fu
+            self.v += self.dt * fv
+            self.w_vel += self.dt * fw
+            self.a_vel += self.dt * fa
+
         # 2. Pressure Projection
         self.apply_boundary_conditions()
         self.poisson_solve()

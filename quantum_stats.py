@@ -92,3 +92,34 @@ def initialize_field_quantum(shape, distribution_type='fermi-dirac', T=1.0, mu=0
         return bose_einstein_distribution(energy + 0.1, T, mu) # Add offset to ensure E > mu
     else:
         raise ValueError(f"Unknown distribution type: {distribution_type}")
+
+def generate_stochastic_forcing(shape, distribution_type='fermi-dirac', T=1.0, mu=0.5, intensity=1.0):
+    """
+    Generate a stochastic forcing field modulated by a quantum statistical distribution.
+    
+    F(x) = Intensity * Distribution(E(x)) * Noise(x)
+    
+    This simulates particle injection or turbulence that is statistically weighted 
+    by the energy landscape (e.g. more turbulence in 'allowed' regions).
+    
+    Args:
+        shape (tuple): Grid shape.
+        distribution_type (str): 'fermi-dirac' or 'bose-einstein'.
+        T (float): Temperature.
+        mu (float): Chemical potential.
+        intensity (float): Scaling factor for the noise.
+        
+    Returns:
+        np.ndarray: The forcing field.
+    """
+    # 1. Calculate the statistical weight (probability of finding a particle/energy)
+    # Re-use initialize logic to get the distribution map
+    stat_weight = initialize_field_quantum(shape, distribution_type, T, mu)
+    
+    # 2. Generate random noise (Gaussian centered at 0)
+    noise = np.random.randn(*shape)
+    
+    # 3. Modulate
+    forcing = intensity * stat_weight * noise
+    
+    return forcing
